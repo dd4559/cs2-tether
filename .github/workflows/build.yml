@@ -1,0 +1,393 @@
+name: Build CS2 4G Tether APK
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Create project files and build APK
+        run: |
+          mkdir -p res/values src/com/opti/cs2tether build/gen build/obj build/dex
+
+          cat << 'EOF' > AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.opti.cs2tether">
+
+              <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="29" />
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".TetherService"
+                      android:exported="false" />
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">CS2 4G Tether</string>
+          </resources>
+          EOF
+
+          cat << 'EOF' > src/com/opti/cs2tether/TetherService.java
+          package com.opti.cs2tether;
+
+          import android.app.*;
+          import android.content.*;
+          import android.os.*;
+          import java.net.*;
+
+          public class TetherService extends Service {
+              public static final String CHANNEL_ID = "cs2_tether_channel";
+              public static volatile long lastPingMs = -1;
+              public static volatile long jitterMs = 0;
+              public static volatile int packetLossPct = 0;
+              public static volatile boolean isServiceRunning = false;
+
+              private PowerManager.WakeLock wakeLock;
+              private volatile boolean running = false;
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  NotificationChannel channel = new NotificationChannel(
+                      CHANNEL_ID, "Optimisation 4G USB", NotificationManager.IMPORTANCE_LOW
+                  );
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  if (nm != null) nm.createNotificationChannel(channel);
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (running) return START_STICKY;
+                  running = true;
+                  isServiceRunning = true;
+
+                  PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                  if (pm != null) {
+                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CS2Tether::ModemKeepAwake");
+                      wakeLock.acquire(6 * 60 * 60 * 1000L);
+                  }
+
+                  startForeground(1, buildNotification("Mode Gaming USB actif..."));
+
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          long prevPing = -1;
+                          int total = 0;
+                          int lost = 0;
+                          NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+
+                          while (running) {
+                              total++;
+                              long ping = measureTcpPing("1.1.1.1", 53, 1500);
+                              if (ping < 0) {
+                                  lost++;
+                                  lastPingMs = -1;
+                              } else {
+                                  if (prevPing > 0) jitterMs = Math.abs(ping - prevPing);
+                                  prevPing = ping;
+                                  lastPingMs = ping;
+                              }
+                              packetLossPct = (lost * 100) / total;
+
+                              String txt = (lastPingMs >= 0)
+                                  ? "Ping: " + lastPingMs + "ms | Jitter: " + jitterMs + "ms | Perte: " + packetLossPct + "%"
+                                  : "Ping: Timeout | Perte: " + packetLossPct + "%";
+
+                              if (nm != null) nm.notify(1, buildNotification(txt));
+
+                              try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+                          }
+                      }
+                  }).start();
+
+                  return START_STICKY;
+              }
+
+              private long measureTcpPing(String host, int port, int timeoutMs) {
+                  Socket socket = new Socket();
+                  try {
+                      long start = System.nanoTime();
+                      socket.connect(new InetSocketAddress(host, port), timeoutMs);
+                      long end = System.nanoTime();
+                      return (end - start) / 1000000L;
+                  } catch (Exception e) {
+                      return -1L;
+                  } finally {
+                      try { socket.close(); } catch (Exception ignored) {}
+                  }
+              }
+
+              private Notification buildNotification(String text) {
+                  Intent i = new Intent(this, MainActivity.class);
+                  PendingIntent pi = PendingIntent.getActivity(this, 0, i, PendingIntent.FLAG_IMMUTABLE);
+                  return new Notification.Builder(this, CHANNEL_ID)
+                      .setContentTitle("CS2 4G Optimizer Actif")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build();
+              }
+
+              @Override
+              public void onDestroy() {
+                  running = false;
+                  isServiceRunning = false;
+                  if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                  super.onDestroy();
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) { return null; }
+          }
+          EOF
+
+          cat << 'EOF' > src/com/opti/cs2tether/MainActivity.java
+          package com.opti.cs2tether;
+
+          import android.app.Activity;
+          import android.content.*;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.*;
+          import android.provider.Settings;
+          import android.telephony.CellSignalStrengthLte;
+          import android.telephony.SignalStrength;
+          import android.telephony.TelephonyManager;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.*;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+              private TextView tvStatus, tvSignal, tvPing;
+              private Button btnToggle;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+
+              private final Runnable updater = new Runnable() {
+                  @Override
+                  public void run() {
+                      updateUI();
+                      handler.postDelayed(this, 800);
+                  }
+              };
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  LinearLayout layout = new LinearLayout(this);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setGravity(Gravity.CENTER_HORIZONTAL);
+                  layout.setPadding(48, 80, 48, 48);
+                  layout.setBackgroundColor(Color.parseColor("#111111"));
+
+                  TextView title = new TextView(this);
+                  title.setText("CS2 / CS:GO 4G OPTIMIZER");
+                  title.setTextSize(22f);
+                  title.setTextColor(Color.WHITE);
+                  title.setGravity(Gravity.CENTER);
+                  title.setPadding(0, 0, 0, 40);
+
+                  tvStatus = new TextView(this);
+                  tvStatus.setTextSize(16f);
+                  tvStatus.setPadding(0, 0, 0, 20);
+
+                  tvSignal = new TextView(this);
+                  tvSignal.setTextSize(18f);
+                  tvSignal.setPadding(0, 0, 0, 20);
+
+                  tvPing = new TextView(this);
+                  tvPing.setTextSize(17f);
+                  tvPing.setTextColor(Color.CYAN);
+                  tvPing.setPadding(0, 0, 0, 40);
+
+                  LinearLayout.LayoutParams btnParams = new LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                  );
+                  btnParams.setMargins(0, 14, 0, 14);
+
+                  btnToggle = new Button(this);
+                  btnToggle.setLayoutParams(btnParams);
+                  btnToggle.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          Intent intent = new Intent(MainActivity.this, TetherService.class);
+                          if (TetherService.isServiceRunning) {
+                              stopService(intent);
+                          } else {
+                              startForegroundService(intent);
+                          }
+                          updateUI();
+                      }
+                  });
+
+                  Button btnTether = new Button(this);
+                  btnTether.setLayoutParams(btnParams);
+                  btnTether.setText("Ouvrir Partage Connexion USB");
+                  btnTether.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          try {
+                              Intent intent = new Intent();
+                              intent.setComponent(new ComponentName("com.android.settings", "com.android.settings.TetherSettings"));
+                              startActivity(intent);
+                          } catch (Exception e) {
+                              startActivity(new Intent(Settings.ACTION_WIRELESS_SETTINGS));
+                          }
+                      }
+                  });
+
+                  Button btnBattery = new Button(this);
+                  btnBattery.setLayoutParams(btnParams);
+                  btnBattery.setText("Autoriser Arrière-plan EMUI (Important)");
+                  btnBattery.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                          if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                              Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                              intent.setData(Uri.parse("package:" + getPackageName()));
+                              startActivity(intent);
+                          }
+                      }
+                  });
+
+                  Button btnNetwork = new Button(this);
+                  btnNetwork.setLayoutParams(btnParams);
+                  btnNetwork.setText("Paramètres Réseau Mobile (4G)");
+                  btnNetwork.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          startActivity(new Intent(Settings.ACTION_DATA_ROAMING_SETTINGS));
+                      }
+                  });
+
+                  layout.addView(title);
+                  layout.addView(tvStatus);
+                  layout.addView(tvSignal);
+                  layout.addView(tvPing);
+                  layout.addView(btnToggle);
+                  layout.addView(btnTether);
+                  layout.addView(btnBattery);
+                  layout.addView(btnNetwork);
+                  setContentView(layout);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  handler.post(updater);
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  handler.removeCallbacks(updater);
+              }
+
+              private void updateUI() {
+                  boolean active = TetherService.isServiceRunning;
+                  tvStatus.setText(active ? "STATUT : MODE GAMING ACTIF" : "STATUT : ARRÊTÉ");
+                  tvStatus.setTextColor(active ? Color.GREEN : Color.GRAY);
+                  btnToggle.setText(active ? "ARRÊTER LE BOOST" : "ACTIVER LE BOOST 4G + WAKELOCK");
+
+                  Integer dbm = getLteDbm();
+                  if (dbm != null) {
+                      if (dbm >= -85) {
+                          tvSignal.setText("Signal 4G : " + dbm + " dBm (EXCELLENT)");
+                          tvSignal.setTextColor(Color.GREEN);
+                      } else if (dbm >= -98) {
+                          tvSignal.setText("Signal 4G : " + dbm + " dBm (MOYEN)");
+                          tvSignal.setTextColor(Color.YELLOW);
+                      } else {
+                          tvSignal.setText("Signal 4G : " + dbm + " dBm (FAIBLE - Déplace le tel)");
+                          tvSignal.setTextColor(Color.RED);
+                      }
+                  } else {
+                      tvSignal.setText("Signal 4G : Non détecté / H+");
+                      tvSignal.setTextColor(Color.RED);
+                  }
+
+                  if (active) {
+                      long p = TetherService.lastPingMs;
+                      tvPing.setText(p >= 0
+                          ? "Ping: " + p + "ms | Jitter: " + TetherService.jitterMs + "ms | Perte: " + TetherService.packetLossPct + "%"
+                          : "Ping: En attente...");
+                  } else {
+                      tvPing.setText("Active le boost pour mesurer le ping");
+                  }
+              }
+
+              private Integer getLteDbm() {
+                  try {
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
+                          if (tm != null) {
+                              SignalStrength ss = tm.getSignalStrength();
+                              if (ss != null) {
+                                  List<CellSignalStrengthLte> list = ss.getCellSignalStrengths(CellSignalStrengthLte.class);
+                                  if (list != null && !list.isEmpty()) {
+                                      return list.get(0).getDbm();
+                                  }
+                              }
+                          }
+                      }
+                  } catch (Exception ignored) {}
+                  return null;
+              }
+          }
+          EOF
+
+          ANDROID_SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          PLATFORM=$(ls -d "$ANDROID_SDK"/platforms/android-* | sort -V | tail -n 1)
+          BUILD_TOOLS=$(ls -d "$ANDROID_SDK"/build-tools/* | sort -V | tail -n 1)
+
+          "$BUILD_TOOLS/aapt2" compile --dir res -o build/res.zip
+          "$BUILD_TOOLS/aapt2" link -I "$PLATFORM/android.jar" --manifest AndroidManifest.xml --java build/gen -o build/unaligned.apk build/res.zip
+          javac -source 1.8 -target 1.8 -classpath "$PLATFORM/android.jar" -d build/obj build/gen/com/opti/cs2tether/R.java src/com/opti/cs2tether/*.java
+          "$BUILD_TOOLS/d8" --lib "$PLATFORM/android.jar" --min-api 26 --output build/dex $(find build/obj -name "*.class")
+          python3 -c "import zipfile; z=zipfile.ZipFile('build/unaligned.apk','a'); z.write('build/dex/classes.dex','classes.dex'); z.close()"
+          "$BUILD_TOOLS/zipalign" -f -p 4 build/unaligned.apk build/aligned.apk
+
+          keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          "$BUILD_TOOLS/apksigner" sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --out CS2_4G_Tether.apk build/aligned.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CS2_4G_Tether_APK
+          path: CS2_4G_Tether.apk
